@@ -2,6 +2,6 @@ services:
   - type: worker
     name: smart-trade-bot
     env: python
-    buildCommand: ""
+    buildCommand: "pip install -r requirements.txt"
     startCommand: "python botik.py"
     plan: free
