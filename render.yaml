@@ -3,5 +3,5 @@ services:
     name: smart-trade-bot
     env: python
     buildCommand: ""
-    startCommand: "python bot.py"
+    startCommand: "python botik.py"
     plan: free
