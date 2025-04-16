@@ -11,16 +11,21 @@ from telebot import types
 
 TOKEN = '7192149351:AAFQOu1ODlMwuzokt31NwR_VoEgwTxvoJEM'
 bot = telebot.TeleBot(TOKEN)
-
 client = Client()
 
 user_data = {}
 awaiting_deposit_input = {}
 watched_signals = set()
-monitored_symbols = ["DOGEUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "TRXUSDT", "LINKUSDT", "MATICUSDT", "BNBUSDT"]
+monitored_symbols = [
+    "DOGEUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
+    "ADAUSDT", "TRXUSDT", "LINKUSDT", "MATICUSDT", "BNBUSDT",
+    "GALAUSDT", "C98USDT", "ARPAUSDT", "1000SATSUSDT", "SANDUSDT",
+    "AGLDUSDT", "RAYUSDT", "CTSIUSDT", "ENSUSDT", "FETUSDT"
+]
 last_signals = []
 last_announcement_time = 0
 SIGNALS_LOG = 'signals_log.csv'
+latest_analysis_info = {"count": 0, "signals": 0, "timestamp": 0}
 
 if not os.path.exists(SIGNALS_LOG):
     df_init = pd.DataFrame(columns=['symbol', 'entry', 'stop', 'take', 'timestamp', 'status', 'direction'])
@@ -35,7 +40,16 @@ def welcome(message):
     markup.row('💼 Установить депозит')
     markup.row('📊 Последние сигналы', '🧠 Начать анализ')
     markup.row('📈 Монета', '📘 Статистика')
+    markup.row('📋 Отчет')
     bot.send_message(user_id, "🧠 Я ваш трейдинг-бот, мой господин.\nВыберите действие с клавиатуры:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '📋 Отчет')
+def show_analysis_info(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_analysis_info["timestamp"]))
+    bot.send_message(
+        message.chat.id,
+        f"📋 Последний анализ:\n🔎 Проверено монет: {latest_analysis_info['count']}\n📌 Сигналов найдено: {latest_analysis_info['signals']}\n🕒 Время: {timestamp}"
+    )
 
 @bot.message_handler(func=lambda message: message.text == '📘 Статистика')
 def show_stats(message):
@@ -87,7 +101,10 @@ def handle_buttons(message):
     elif awaiting_deposit_input.get(user_id):
         try:
             val = float(message.text.strip())
-            user_data[user_id]['deposit'] = val
+            if user_id not in user_data:
+                user_data[user_id] = {'deposit': val, 'risk': 1.0}
+            else:
+                user_data[user_id]['deposit'] = val
             awaiting_deposit_input[user_id] = False
             bot.send_message(user_id, f"✅ Депозит установлен: {val} USDT")
         except:
@@ -122,6 +139,47 @@ def handle_coin_selection(call):
     except Exception as e:
         bot.send_message(call.message.chat.id, "⚠️ Ошибка при получении информации по монете.")
         print("Ошибка в handle_coin_selection:", e)
+
+def analyze_market(user_id):
+    global last_announcement_time, latest_analysis_info
+    while True:
+        analyzed = 0
+        signals_found = 0
+        for symbol in monitored_symbols:
+            try:
+                analyzed += 1
+                h1_klines = client.get_klines(symbol=symbol, interval="1h", limit=100)
+                h1_df = pd.DataFrame(h1_klines, columns=["timestamp", "open", "high", "low", "close", "volume",
+                                                          "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
+                h1_df["close"] = pd.to_numeric(h1_df["close"])
+                rsi_h1 = RSIIndicator(h1_df["close"], window=14).rsi().iloc[-1]
+                ema = EMAIndicator(h1_df["close"], window=200).ema_indicator().iloc[-1]
+                price_now = h1_df["close"].iloc[-1]
+                direction = None
+                if rsi_h1 < 30 and price_now > ema:
+                    direction = 'long'
+                elif rsi_h1 > 70 and price_now < ema:
+                    direction = 'short'
+                if direction:
+                    m5_klines = client.get_klines(symbol=symbol, interval="5m", limit=10)
+                    df = pd.DataFrame(m5_klines, columns=["timestamp", "open", "high", "low", "close", "volume",
+                                                          "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
+                    df["close"] = pd.to_numeric(df["close"])
+                    df["open"] = pd.to_numeric(df["open"])
+                    df["low"] = pd.to_numeric(df["low"])
+                    df["high"] = pd.to_numeric(df["high"])
+                    if check_reversal_pattern(df, direction) and f"{symbol}_{direction}" not in watched_signals:
+                        signals_found += 1
+                        # Место для логики отправки сигнала
+            except Exception as e:
+                print(f"Ошибка анализа для {symbol}: {e}")
+            time.sleep(0.2)
+        latest_analysis_info = {
+            "count": analyzed,
+            "signals": signals_found,
+            "timestamp": int(time.time())
+        }
+        time.sleep(60)
 
 def check_reversal_pattern(df, direction):
     last = df.iloc[-1]
@@ -173,69 +231,5 @@ def update_signal_status():
         except Exception as e:
             print("Ошибка обновления сигналов:", e)
         time.sleep(300)
-
-def analyze_market(user_id):
-    global last_announcement_time
-    while True:
-        current_time = time.time()
-        if current_time - last_announcement_time > 1800:
-            bot.send_message(user_id, "🔍 Бот продолжает анализировать рынок...")
-            last_announcement_time = current_time
-        for symbol in monitored_symbols:
-            try:
-                h1_klines = client.get_klines(symbol=symbol, interval="1h", limit=100)
-                h1_df = pd.DataFrame(h1_klines, columns=["timestamp", "open", "high", "low", "close", "volume",
-                                                          "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
-                h1_df["close"] = pd.to_numeric(h1_df["close"])
-                rsi_h1 = RSIIndicator(h1_df["close"], window=14).rsi().iloc[-1]
-                ema = EMAIndicator(h1_df["close"], window=200).ema_indicator().iloc[-1]
-                price_now = h1_df["close"].iloc[-1]
-                direction = None
-                if rsi_h1 < 30 and price_now > ema:
-                    direction = 'long'
-                elif rsi_h1 > 70 and price_now < ema:
-                    direction = 'short'
-                if direction:
-                    m5_klines = client.get_klines(symbol=symbol, interval="5m", limit=10)
-                    df = pd.DataFrame(m5_klines, columns=["timestamp", "open", "high", "low", "close", "volume",
-                                                          "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
-                    df["close"] = pd.to_numeric(df["close"])
-                    df["open"] = pd.to_numeric(df["open"])
-                    df["low"] = pd.to_numeric(df["low"])
-                    df["high"] = pd.to_numeric(df["high"])
-                    if check_reversal_pattern(df, direction) and f"{symbol}_{direction}" not in watched_signals:
-                        price = float(df["close"].iloc[-1])
-                        stop = price - price * 0.02 if direction == 'long' else price + price * 0.02
-                        take = price + price * 0.04 if direction == 'long' else price - price * 0.04
-                        user_deposit = user_data[user_id]['deposit']
-                        user_risk_percent = user_data[user_id]['risk']
-                        risk_usdt = user_deposit * user_risk_percent / 100
-                        volume = round(risk_usdt / abs(price - stop), 2)
-                        last_signals.append({
-                            'symbol': symbol,
-                            'entry': round(price, 4),
-                            'stop': round(stop, 4),
-                            'take': round(take, 4),
-                            'rsi': round(rsi_h1, 2),
-                            'dir': direction,
-                            'volume': volume,
-                            'cost': round(volume * price, 2),
-                            'risk': round(risk_usdt, 2),
-                            'percent': round((volume * price) / user_deposit * 100, 1)
-                        })
-                        watched_signals.add(f"{symbol}_{direction}")
-                        timestamp = int(time.time())
-                        with open(SIGNALS_LOG, 'a') as f:
-                            f.write(f"{symbol},{round(price, 4)},{round(stop, 4)},{round(take, 4)},{timestamp},pending,{direction}\n")
-                        bot.send_message(user_id,
-                            f"📊 Сигнал ({'🟩 LONG' if direction == 'long' else '🟥 SHORT'}): {symbol}\n"
-                            f"💵 Цена: {round(price, 4)} | RSI(1H): {round(rsi_h1, 2)}\n"
-                            f"🛑 Стоп: {round(stop, 4)} | 🎯 Тейк: {round(take, 4)}\n"
-                            f"📦 Объём: {volume} ({round(volume * price, 2)} USDT)\n"
-                            f"📍 Условие: RSI + свеча + EMA фильтр\n"
-                            f"⚙️ Binance вход: 100% от депозита | Плечо: x1")
-            except Exception as e:
-                print("Ошибка анализа:", e)
-        time.sleep(60)
 
 bot.polling(none_stop=True)
