@@ -1,4 +1,5 @@
 python-telegram-bot==13.15
+pyTelegramBotAPI
 python-binance==1.0.28
 ta==0.11.0
 pandas
