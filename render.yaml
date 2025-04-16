@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: smart-trade-bot
     env: python
     buildCommand: ""
