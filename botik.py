@@ -1,235 +1,184 @@
-import telebot
+# Бот с полной логикой и фиксами (включая баг с депозитом)
+
+import os
 import time
 import pandas as pd
-import os
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
 from threading import Thread
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
+from dotenv import load_dotenv
+import telebot
 from telebot import types
+from binance.client import Client
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, MACD
 
-TOKEN = '7192149351:AAFQOu1ODlMwuzokt31NwR_VoEgwTxvoJEM'
+# Загрузка .env и ключей
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
 bot = telebot.TeleBot(TOKEN)
-client = Client()
+client = Client(api_key=API_KEY, api_secret=API_SECRET)
+
+monitored_symbols = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT",
+    "LINKUSDT", "MATICUSDT", "ARBUSDT", "INJUSDT", "OPUSDT", "APTUSDT", "SUIUSDT",
+    "RNDRUSDT", "LDOUSDT", "AAVEUSDT", "NEARUSDT", "FTMUSDT"
+]
 
 user_data = {}
 awaiting_deposit_input = {}
-watched_signals = set()
-monitored_symbols = [
-    "DOGEUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "TRXUSDT", "LINKUSDT", "MATICUSDT", "BNBUSDT",
-    "GALAUSDT", "C98USDT", "ARPAUSDT", "1000SATSUSDT", "SANDUSDT",
-    "AGLDUSDT", "RAYUSDT", "CTSIUSDT", "ENSUSDT", "FETUSDT"
-]
+user_analysis_flags = {}
 last_signals = []
-last_announcement_time = 0
+last_analysis_logs = []
 SIGNALS_LOG = 'signals_log.csv'
-latest_analysis_info = {"count": 0, "signals": 0, "timestamp": 0}
 
 if not os.path.exists(SIGNALS_LOG):
-    df_init = pd.DataFrame(columns=['symbol', 'entry', 'stop', 'take', 'timestamp', 'status', 'direction'])
-    df_init.to_csv(SIGNALS_LOG, index=False)
+    pd.DataFrame(columns=['symbol', 'entry', 'stop', 'take', 'timestamp', 'status', 'direction']).to_csv(SIGNALS_LOG, index=False)
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
     user_id = message.chat.id
     if user_id not in user_data:
-        user_data[user_id] = {'deposit': 50, 'risk': 1.0}
+        user_data[user_id] = {'deposit': 100, 'risk': 1.0}
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row('💼 Установить депозит')
     markup.row('📊 Последние сигналы', '🧠 Начать анализ')
-    markup.row('📈 Монета', '📘 Статистика')
-    markup.row('📋 Отчет')
-    bot.send_message(user_id, "🧠 Я ваш трейдинг-бот, мой господин.\nВыберите действие с клавиатуры:", reply_markup=markup)
+    markup.row('📈 Монета', '📘 Статистика', '🦾 Отчёт')
+    bot.send_message(user_id, "Добро пожаловать в PRO трейдинг-бота. Выберите опцию:", reply_markup=markup)
 
-@bot.message_handler(func=lambda message: message.text == '📋 Отчет')
-def show_analysis_info(message):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_analysis_info["timestamp"]))
-    bot.send_message(
-        message.chat.id,
-        f"📋 Последний анализ:\n🔎 Проверено монет: {latest_analysis_info['count']}\n📌 Сигналов найдено: {latest_analysis_info['signals']}\n🕒 Время: {timestamp}"
-    )
+@bot.message_handler(func=lambda message: message.text == '💼 Установить депозит')
+def set_deposit(message):
+    awaiting_deposit_input[message.chat.id] = True
+    bot.send_message(message.chat.id, "Введите сумму вашего депозита в USDT:")
 
-@bot.message_handler(func=lambda message: message.text == '📘 Статистика')
+@bot.message_handler(func=lambda m: awaiting_deposit_input.get(m.chat.id, False))
+def save_deposit(message):
+    text = message.text.strip().replace(",", ".")
+    if text.lower() == "отмена":
+        awaiting_deposit_input[message.chat.id] = False
+        bot.send_message(message.chat.id, "🚫 Установка депозита отменена.")
+        return
+    try:
+        deposit = float(text)
+        if deposit <= 0:
+            bot.send_message(message.chat.id, "❌ Введите число больше нуля.")
+            return
+        user_data[message.chat.id]['deposit'] = deposit
+        awaiting_deposit_input[message.chat.id] = False
+        bot.send_message(message.chat.id, f"✅ Депозит установлен: {deposit} USDT")
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка. Введите только положительное число или напишите 'Отмена'")
+
+@bot.message_handler(func=lambda m: m.text == '🧠 Начать анализ')
+def start_analysis(message):
+    user_id = message.chat.id
+    if user_analysis_flags.get(user_id, False):
+        bot.send_message(user_id, "⏳ Анализ уже запущен.")
+    else:
+        bot.send_message(user_id, "🚀 Запускаю анализ рынка...")
+        user_analysis_flags[user_id] = True
+        Thread(target=analyze_market, args=(user_id,)).start()
+
+@bot.message_handler(func=lambda m: m.text == '📈 Монета')
+def choose_coin(message):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for symbol in monitored_symbols:
+        markup.add(types.InlineKeyboardButton(text=symbol.replace("USDT", ""), callback_data=symbol))
+    bot.send_message(message.chat.id, "Выберите монету:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == '📘 Статистика')
 def show_stats(message):
     try:
         df = pd.read_csv(SIGNALS_LOG)
         total = len(df)
-        wins = len(df[df['status'] == 'win'])
-        losses = len(df[df['status'] == 'loss'])
-        pending = len(df[df['status'] == 'pending'])
-        winrate = round((wins / total) * 100, 1) if total > 0 else 0
-        latest = df.tail(3)
-        lines = [f"• {row['symbol']} → {row['status']}" for _, row in latest.iterrows()]
-        result = (
-            f"📘 Ваша торговая статистика:\n\n"
-            f"Всего сигналов: {total}\n"
-            f"🟢 В плюс: {wins}\n"
-            f"🔴 В минус: {losses}\n"
-            f"⏳ Ожидают: {pending}\n"
-            f"📊 Winrate: {winrate}%\n\n"
-            f"Последние:\n" + '\n'.join(lines)
-        )
-        bot.send_message(message.chat.id, result)
+        win = len(df[df.status == 'win'])
+        loss = len(df[df.status == 'loss'])
+        pending = len(df[df.status == 'pending'])
+        bot.send_message(message.chat.id, f"📊 Всего сигналов: {total}\n🟢 Побед: {win}\n🔴 Поражений: {loss}\n⏳ В ожидании: {pending}")
     except Exception as e:
-        bot.send_message(message.chat.id, "⚠️ Ошибка чтения статистики.")
-        print("Ошибка статистики:", e)
+        bot.send_message(message.chat.id, f"Ошибка чтения статистики: {e}")
 
-@bot.message_handler(func=lambda message: message.text == '📊 Последние сигналы')
-def show_signals(message):
-    if not last_signals:
-        bot.send_message(message.chat.id, "📭 Пока нет активных сигналов.")
-    else:
-        response = "📜 Последние сигналы:\n"
-        for s in last_signals[-10:]:
-            response += (
-                f"\n📈 {s['symbol']} ({'LONG' if s['dir'] == 'long' else 'SHORT'})\n"
-                f"• Вход: {s['entry']}\n"
-                f"• Стоп: {s['stop']}\n"
-                f"• Тейк: {s['take']}\n"
-                f"• RSI: {s['rsi']}\n"
-            )
-        bot.send_message(message.chat.id, response)
+@bot.message_handler(func=lambda m: m.text == '🦾 Отчёт')
+def show_analysis_info(message):
+    total = len(monitored_symbols)
+    logs = "\n\n".join(last_analysis_logs[-5:]) if last_analysis_logs else "Пока нет анализа."
+    bot.send_message(message.chat.id, f"🔍 Монет в анализе: {total}\n📋 Последние проверки:\n\n{logs}")
 
-@bot.message_handler(func=lambda m: True)
-def handle_buttons(message):
-    user_id = message.chat.id
-    if message.text == '💼 Установить депозит':
-        awaiting_deposit_input[user_id] = True
-        bot.send_message(user_id, "💰 Введите сумму вашего депозита в USDT:")
-    elif awaiting_deposit_input.get(user_id):
-        try:
-            val = float(message.text.strip())
-            if user_id not in user_data:
-                user_data[user_id] = {'deposit': val, 'risk': 1.0}
-            else:
-                user_data[user_id]['deposit'] = val
-            awaiting_deposit_input[user_id] = False
-            bot.send_message(user_id, f"✅ Депозит установлен: {val} USDT")
-        except:
-            bot.send_message(user_id, "❌ Ошибка. Введите только число, например: 50")
-    elif message.text == '🧠 Начать анализ':
-        bot.send_message(user_id, "📡 Запускаю анализ рынка...")
-        Thread(target=analyze_market, args=(user_id,)).start()
-        Thread(target=update_signal_status).start()
-    elif message.text == '📈 Монета':
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        buttons = [types.InlineKeyboardButton(text=s.replace("USDT", ""), callback_data=f"монета_{s}") for s in monitored_symbols]
-        markup.add(*buttons)
-        bot.send_message(user_id, "💠 Выберите монету:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("монета_"))
-def handle_coin_selection(call):
-    symbol = call.data.replace("монета_", "")
+@bot.callback_query_handler(func=lambda call: True)
+def handle_coin_callback(call):
+    symbol = call.data
     try:
         klines = client.get_klines(symbol=symbol, interval="1h", limit=100)
-        df = pd.DataFrame(klines, columns=["timestamp", "open", "high", "low", "close", "volume",
-                                           "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
-        df["close"] = pd.to_numeric(df["close"])
-        rsi = RSIIndicator(df["close"], window=14).rsi().iloc[-1]
-        price = float(df["close"].iloc[-1])
-        signal = next((s for s in last_signals if s['symbol'] == symbol), None)
-        text = f"📈 {symbol}\n💵 Рыночная цена: {round(price, 4)} USDT\n📊 RSI (1H): {round(rsi, 2)}\n"
-        if signal:
-            text += f"🟢 Активный сигнал ({'LONG' if signal['dir']=='long' else 'SHORT'}):\n• Вход: {signal['entry']}\n• Стоп: {signal['stop']}\n• Тейк: {signal['take']}"
-        else:
-            text += "🔍 Пока нет сигнала для входа."
-        bot.send_message(call.message.chat.id, text)
+        df = pd.DataFrame(klines, columns=["timestamp", "open", "high", "low", "close", "volume", "c1", "c2", "c3", "c4", "c5", "c6"])
+        df['close'] = pd.to_numeric(df['close'])
+        price = df['close'].iloc[-1]
+        rsi = RSIIndicator(df['close']).rsi().iloc[-1]
+        bot.send_message(call.message.chat.id, f"📈 {symbol}\nЦена: {price:.2f} USDT\nRSI (1H): {rsi:.2f}")
     except Exception as e:
-        bot.send_message(call.message.chat.id, "⚠️ Ошибка при получении информации по монете.")
-        print("Ошибка в handle_coin_selection:", e)
+        bot.send_message(call.message.chat.id, f"Ошибка получения данных по {symbol}: {e}")
+
+def detect_candle_pattern(df, direction):
+    last_open = float(df['open'].iloc[-1])
+    last_close = float(df['close'].iloc[-1])
+    prev_open = float(df['open'].iloc[-2])
+    prev_close = float(df['close'].iloc[-2])
+    if direction == 'long':
+        return last_close > last_open and last_open < prev_close and last_close > prev_open
+    else:
+        return last_close < last_open and last_open > prev_close and last_close < prev_open
 
 def analyze_market(user_id):
-    global last_announcement_time, latest_analysis_info
     while True:
-        analyzed = 0
-        signals_found = 0
         for symbol in monitored_symbols:
             try:
-                analyzed += 1
-                h1_klines = client.get_klines(symbol=symbol, interval="1h", limit=100)
-                h1_df = pd.DataFrame(h1_klines, columns=["timestamp", "open", "high", "low", "close", "volume",
-                                                          "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
-                h1_df["close"] = pd.to_numeric(h1_df["close"])
-                rsi_h1 = RSIIndicator(h1_df["close"], window=14).rsi().iloc[-1]
-                ema = EMAIndicator(h1_df["close"], window=200).ema_indicator().iloc[-1]
-                price_now = h1_df["close"].iloc[-1]
-                direction = None
-                if rsi_h1 < 30 and price_now > ema:
-                    direction = 'long'
-                elif rsi_h1 > 70 and price_now < ema:
-                    direction = 'short'
-                if direction:
-                    m5_klines = client.get_klines(symbol=symbol, interval="5m", limit=10)
-                    df = pd.DataFrame(m5_klines, columns=["timestamp", "open", "high", "low", "close", "volume",
-                                                          "close_time", "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
-                    df["close"] = pd.to_numeric(df["close"])
-                    df["open"] = pd.to_numeric(df["open"])
-                    df["low"] = pd.to_numeric(df["low"])
-                    df["high"] = pd.to_numeric(df["high"])
-                    if check_reversal_pattern(df, direction) and f"{symbol}_{direction}" not in watched_signals:
-                        signals_found += 1
-                        # Место для логики отправки сигнала
+                df_1h = pd.DataFrame(client.get_klines(symbol=symbol, interval="1h", limit=100),
+                                  columns=["timestamp", "open", "high", "low", "close", "volume", "c1", "c2", "c3", "c4", "c5", "c6"])
+                df_1h['close'] = pd.to_numeric(df_1h['close'])
+                df_1h['open'] = pd.to_numeric(df_1h['open'])
+                df_1h['volume'] = pd.to_numeric(df_1h['volume'])
+
+                rsi_1h = RSIIndicator(df_1h['close']).rsi().iloc[-1]
+                ema_1h = EMAIndicator(df_1h['close'], window=200).ema_indicator().iloc[-1]
+                macd_1h = MACD(df_1h['close']).macd_diff().iloc[-1]
+                price_1h = df_1h['close'].iloc[-1]
+                support = df_1h['close'].rolling(window=20).min().iloc[-1]
+                resistance = df_1h['close'].rolling(window=20).max().iloc[-1]
+
+                trend_long = rsi_1h < 30 and price_1h > ema_1h and macd_1h > 0 and price_1h <= support * 1.02
+                trend_short = rsi_1h > 70 and price_1h < ema_1h and macd_1h < 0 and price_1h >= resistance * 0.98
+
+                df_5m = pd.DataFrame(client.get_klines(symbol=symbol, interval="5m", limit=100),
+                                  columns=["timestamp", "open", "high", "low", "close", "volume", "c1", "c2", "c3", "c4", "c5", "c6"])
+                df_5m['close'] = pd.to_numeric(df_5m['close'])
+                df_5m['open'] = pd.to_numeric(df_5m['open'])
+                df_5m['volume'] = pd.to_numeric(df_5m['volume'])
+
+                price_5m = df_5m['close'].iloc[-1]
+
+                if trend_long and detect_candle_pattern(df_5m, 'long'):
+                    send_signal(user_id, symbol, price_5m, 'long')
+                elif trend_short and detect_candle_pattern(df_5m, 'short'):
+                    send_signal(user_id, symbol, price_5m, 'short')
+                else:
+                    last_analysis_logs.append(f"{symbol}: тренд не подтверждён или нет свечи входа.")
+                    if len(last_analysis_logs) > 10:
+                        last_analysis_logs.pop(0)
+
             except Exception as e:
-                print(f"Ошибка анализа для {symbol}: {e}")
-            time.sleep(0.2)
-        latest_analysis_info = {
-            "count": analyzed,
-            "signals": signals_found,
-            "timestamp": int(time.time())
-        }
+                bot.send_message(user_id, f"Ошибка анализа {symbol}: {e}")
         time.sleep(60)
 
-def check_reversal_pattern(df, direction):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    open_ = float(last['open'])
-    close = float(last['close'])
-    low = float(last['low'])
-    high = float(last['high'])
-    body = abs(close - open_)
-    shadow = (open_ - low) if close > open_ else (high - close)
-    if direction == 'long':
-        is_hammer = shadow > body * 1.5 and close > open_
-        is_engulfing = close > open_ and open_ < prev['close'] and close > prev['open']
-        return is_hammer or is_engulfing
-    else:
-        is_inverted_hammer = shadow > body * 1.5 and close < open_
-        is_bearish_engulfing = close < open_ and open_ > prev['close'] and close < prev['open']
-        return is_inverted_hammer or is_bearish_engulfing
-
-def update_signal_status():
-    while True:
-        try:
-            df = pd.read_csv(SIGNALS_LOG)
-            updated = False
-            for idx, row in df[df['status'] == 'pending'].iterrows():
-                symbol = row['symbol']
-                stop = float(row['stop'])
-                take = float(row['take'])
-                candles = client.get_klines(symbol=symbol, interval="5m", limit=10)
-                closes = [float(c[4]) for c in candles]
-                high = max(closes)
-                low = min(closes)
-                if row['direction'] == 'long':
-                    if high >= take:
-                        df.at[idx, 'status'] = 'win'
-                        updated = True
-                    elif low <= stop:
-                        df.at[idx, 'status'] = 'loss'
-                        updated = True
-                else:
-                    if low <= take:
-                        df.at[idx, 'status'] = 'win'
-                        updated = True
-                    elif high >= stop:
-                        df.at[idx, 'status'] = 'loss'
-                        updated = True
-            if updated:
-                df.to_csv(SIGNALS_LOG, index=False)
-        except Exception as e:
-            print("Ошибка обновления сигналов:", e)
-        time.sleep(300)
+def send_signal(user_id, symbol, price, direction):
+    deposit = user_data[user_id]['deposit']
+    risk = deposit * user_data[user_id]['risk'] / 100
+    stop = price * (0.98 if direction == 'long' else 1.02)
+    take = price * (1.04 if direction == 'long' else 0.96)
+    volume = round(risk / abs(price - stop), 2)
+    last_signals.append({'symbol': symbol, 'entry': price, 'stop': stop, 'take': take, 'dir': direction})
+    with open(SIGNALS_LOG, 'a') as f:
+        f.write(f"{symbol},{price:.2f},{stop:.2f},{take:.2f},{int(time.time())},pending,{direction}\n")
+    bot.send_message(user_id,
+        f"📢 Новый сигнал {symbol} ({'LONG' if direction == 'long' else 'SHORT'})\n💰 Цена: {price:.2f} USDT\n⛔ Стоп: {stop:.2f}\n🎯 Тейк: {take:.2f}\n📦 Объём: {volume}")
 
 bot.polling(none_stop=True)
